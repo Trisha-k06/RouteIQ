@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 from pypdf import PdfReader
@@ -10,10 +10,17 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 @dataclass
 class AnalysisResult:
+    """
+    Knowledge Representation (KR):
+    - topics_by_unit: Unit -> [topic, ...]
+    - topic_importance: "Unit X: Topic" -> importance score (derived from past papers OR syllabus-only reasoning)
+    - questions / question_topic: evidence used when past papers exist
+    """
     topics_by_unit: Dict[str, List[str]]
     questions: List[str]
     question_topic: List[Tuple[str, str, float]]  # (question, mapped_topic, confidence)
-    topic_frequency: Dict[str, int]
+    topic_importance: Dict[str, float]
+    has_past_papers: bool
 
 
 def read_pdf_text(file_bytes: bytes) -> str:
@@ -175,7 +182,6 @@ def extract_questions(paper_text: str) -> List[str]:
 def map_questions_to_topics(
     questions: List[str],
     topics_by_unit: Dict[str, List[str]],
-    threshold: float = 0.16,
 ) -> Tuple[List[Tuple[str, str, float]], Dict[str, int]]:
     """
     TF-IDF similarity: question vs topic strings.
@@ -205,7 +211,8 @@ def map_questions_to_topics(
     for i, q in enumerate(questions):
         j = int(np.argmax(sims[i]))
         conf = float(sims[i, j])
-        topic = all_topics[j] if conf >= threshold else "UNMAPPED"
+        # Keep "UNMAPPED" internal; we don't expose this as a confusing setting.
+        topic = all_topics[j] if conf >= 0.16 else "UNMAPPED"
         mapped.append((q, topic, conf))
         if topic != "UNMAPPED":
             freq[topic] += 1
@@ -215,15 +222,65 @@ def map_questions_to_topics(
     return mapped, freq
 
 
+def filter_units(topics_by_unit: Dict[str, List[str]], selected_units: Optional[List[str]]) -> Dict[str, List[str]]:
+    if not selected_units:
+        return topics_by_unit
+    return {u: topics_by_unit[u] for u in selected_units if u in topics_by_unit}
+
+
+def _syllabus_only_importance(topics_by_unit: Dict[str, List[str]]) -> Dict[str, float]:
+    """
+    Syllabus-only reasoning (offline):
+    - Start with base importance 1.0 per topic.
+    - Boost topics with "exam/important/key" terms (if present).
+    - Slightly boost shorter, crisp topics (often better-defined exam units) but keep within a safe range.
+    """
+    imp: Dict[str, float] = {}
+    exam_boost_re = re.compile(r"\b(important|key|exam|revision|derivation|algorithm)\b", re.IGNORECASE)
+    for unit, topics in topics_by_unit.items():
+        for tp in topics:
+            score = 1.0
+            if exam_boost_re.search(tp):
+                score += 0.4
+            # length heuristic: very long phrases are often combined lines; keep mild
+            n = max(1, len(tp.split()))
+            if n <= 3:
+                score += 0.2
+            elif n >= 10:
+                score -= 0.1
+            score = float(max(0.5, min(2.0, score)))
+            imp[f"{unit}: {tp}"] = score
+    return imp
+
+
+def _pastpaper_importance_from_frequency(freq: Dict[str, int], topics_by_unit: Dict[str, List[str]]) -> Dict[str, float]:
+    """
+    Turn past-paper frequencies into importance scores.
+    Also ensure every topic gets at least a small baseline so planning still covers breadth.
+    """
+    # baseline from syllabus-only to avoid zeroing unseen topics
+    base = _syllabus_only_importance(topics_by_unit)
+    if not freq:
+        return base
+
+    max_f = max(freq.values()) if freq else 1
+    imp: Dict[str, float] = {}
+    for topic, base_score in base.items():
+        f = float(freq.get(topic, 0))
+        # normalize frequency to [0,1] then blend with baseline
+        norm = f / float(max_f)
+        imp[topic] = float(base_score + (1.8 * norm))
+    return imp
+
+
 def analyze(
     syllabus_text: str,
     paper_texts: List[str],
-    selected_units: List[str] = None,
+    selected_units: Optional[List[str]] = None,
 ) -> AnalysisResult:
     topics_by_unit = extract_units_and_topics(syllabus_text)
 
-    if selected_units:
-        topics_by_unit = filter_units(topics_by_unit, selected_units)
+    topics_by_unit = filter_units(topics_by_unit, selected_units)
 
     all_questions: List[str] = []
     for pt in (paper_texts or []):
@@ -233,30 +290,16 @@ def analyze(
 
     if all_questions:
         q_topic, freq = map_questions_to_topics(all_questions, topics_by_unit)
+        topic_importance = _pastpaper_importance_from_frequency(freq, topics_by_unit)
     else:
         q_topic = []
-        freq = syllabus_only_frequency(topics_by_unit)
+        freq = {}
+        topic_importance = _syllabus_only_importance(topics_by_unit)
 
     return AnalysisResult(
         topics_by_unit=topics_by_unit,
         questions=all_questions,
         question_topic=q_topic,
-        topic_frequency=freq,
+        topic_importance=topic_importance,
+        has_past_papers=bool(all_questions),
     )
-def filter_units(topics_by_unit, selected_units):
-    if not selected_units:
-        return topics_by_unit
-    return {u: topics_by_unit[u] for u in selected_units if u in topics_by_unit}
-
-
-def syllabus_only_frequency(topics_by_unit):
-    """
-    If no past papers, we still need 'importance' weights.
-    Simple MVP: give each topic weight 1.
-    (Later you can improve: weight by subtopic length or keywords.)
-    """
-    freq = {}
-    for unit, topics in topics_by_unit.items():
-        for tp in topics:
-            freq[f"{unit}: {tp}"] = 1
-    return freq

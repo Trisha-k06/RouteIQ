@@ -1,6 +1,6 @@
 import os
 import re
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -39,6 +39,31 @@ def retrieve_relevant_chunks(material_text: str, query: str, k: int = 5) -> List
     return [chunks[i] for i in top_idx]
 
 
+def build_notes_prompt(context_chunks: List[str], mode: str, unit_or_topic: str, length: str) -> str:
+    """
+    Compact prompt; avoids repeated token-heavy calls.
+    """
+    context = "\n\n".join(context_chunks)[:12000]
+    instruction = {
+        "full_unit": "Create well-structured unit notes with headings and subpoints.",
+        "topic": "Create focused notes ONLY for the requested topic.",
+        "short_exam": "Create exam-oriented short notes: crisp bullets, key steps, typical question angles.",
+        "definitions": "List important definitions and key terms with 1–2 line explanations.",
+    }[mode]
+    len_hint = {"short": "Keep it short.", "medium": "Moderate detail.", "long": "Detailed notes."}[length]
+
+    return (
+        "You are a study notes generator.\n"
+        f"Task: {instruction}\n"
+        f"{len_hint}\n\n"
+        f"Target: {unit_or_topic}\n\n"
+        "Use ONLY the provided material context. If something is missing, say: Not found in material.\n"
+        "Return clean markdown with headings and bullet points.\n\n"
+        "MATERIAL CONTEXT:\n"
+        f"{context}"
+    ).strip()
+
+
 def generate_notes_openai(
     context_chunks: List[str],
     mode: str,
@@ -54,31 +79,7 @@ def generate_notes_openai(
 
     client = OpenAI()
 
-    context = "\n\n".join(context_chunks)[:12000]  # keep token usage sane
-
-    instruction = {
-        "full_unit": "Create well-structured chapter notes with headings, subpoints, and examples where relevant.",
-        "topic": "Create focused notes ONLY for the requested topic. Include key idea, steps/algorithm if relevant, and common exam points.",
-        "short_exam": "Create exam-oriented short notes: crisp bullets, key steps, and typical question angles.",
-        "definitions": "List important definitions and key terms with 1–2 line explanations.",
-    }[mode]
-
-    len_hint = {"short": "Keep it short.", "medium": "Moderate detail.", "long": "Detailed notes."}[length]
-
-    prompt = f"""
-You are a study notes generator.
-Task: {instruction}
-{len_hint}
-
-Target: {unit_or_topic}
-
-Use ONLY the provided material context. If something is missing, say "Not found in material".
-
-Return in clean markdown with headings and bullet points.
-
-MATERIAL CONTEXT:
-{context}
-""".strip()
+    prompt = build_notes_prompt(context_chunks=context_chunks, mode=mode, unit_or_topic=unit_or_topic, length=length)
 
     resp = client.responses.create(
         model="gpt-4o-mini",
